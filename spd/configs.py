@@ -847,6 +847,22 @@ class Config(BaseConfig):
         description="Interval (in steps) at which to save model checkpoints (None disables saving "
         "until the end of training).",
     )
+    resume_dir: str | None = Field(
+        default=None,
+        description="Directory for full resumable training checkpoints (model, optimizer, "
+        "persistent-PGD state, RNG, data position). If it holds a complete checkpoint, training "
+        "resumes from it. None disables resumable checkpointing.",
+    )
+    resume_save_freq: PositiveInt | None = Field(
+        default=None,
+        description="Interval (in steps) at which to write resumable checkpoints to resume_dir. "
+        "A checkpoint is also written when SIGTERM/SIGUSR1 is received.",
+    )
+    stop_after_step: PositiveInt | None = Field(
+        default=None,
+        description="End this process at the top of this step (checkpointing first if resume_dir "
+        "is set). LR and other schedules still use `steps`. None runs to `steps`.",
+    )
     eval_metric_configs: list[Annotated[MetricConfigType, Field(discriminator="classname")]] = (
         Field(
             default=[],

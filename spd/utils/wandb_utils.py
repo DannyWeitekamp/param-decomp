@@ -324,6 +324,7 @@ def init_wandb(
         entity=get_wandb_entity(),
         name=name,
         tags=tags,
+        resume="allow",
     )
     assert wandb.run is not None
     wandb.run.log_code(

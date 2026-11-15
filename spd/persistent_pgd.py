@@ -51,6 +51,14 @@ class PPGDOptimizer(ABC):
     def set_lr(self, lr: float) -> None:
         """Update the learning rate / step size."""
 
+    @abstractmethod
+    def state_dict(self) -> dict[str, object]:
+        """Optimizer state needed to resume (excludes lr, which is recomputed from the step)."""
+
+    @abstractmethod
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore state produced by `state_dict`, copying tensors in place."""
+
 
 class SignPGDOptimizer(PPGDOptimizer):
     def __init__(self, cfg: SignPGDConfig) -> None:
@@ -68,6 +76,14 @@ class SignPGDOptimizer(PPGDOptimizer):
     @override
     def set_lr(self, lr: float) -> None:
         self._step_size = lr
+
+    @override
+    def state_dict(self) -> dict[str, object]:
+        return {}
+
+    @override
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        assert state == {}, f"SignPGDOptimizer has no state, got keys {list(state)}"
 
 
 class AdamPGDOptimizer(PPGDOptimizer):
@@ -105,6 +121,28 @@ class AdamPGDOptimizer(PPGDOptimizer):
     @override
     def set_lr(self, lr: float) -> None:
         self._lr = lr
+
+    @override
+    def state_dict(self) -> dict[str, object]:
+        return {"step_count": self._step_count, "m": self._m, "v": self._v}
+
+    @override
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        step_count, m, v = state["step_count"], state["m"], state["v"]
+        assert isinstance(step_count, int) and isinstance(m, dict) and isinstance(v, dict)
+        _copy_sources_(self._m, m)
+        _copy_sources_(self._v, v)
+        self._step_count = step_count
+
+
+def _copy_sources_(dst: PPGDSources, src: dict[str, Tensor]) -> None:
+    assert dst.keys() == src.keys(), f"module mismatch: {sorted(dst)} vs {sorted(src)}"
+    for name, tensor in dst.items():
+        assert tensor.shape == src[name].shape, (
+            f"{name}: shape {tuple(tensor.shape)} vs saved {tuple(src[name].shape)}"
+        )
+        with torch.no_grad():
+            tensor.copy_(src[name])
 
 
 def make_ppgd_optimizer(cfg: PGDOptimizerConfig) -> PPGDOptimizer:
@@ -201,6 +239,15 @@ class PersistentPGDState:
         if self._use_sigmoid_parameterization:
             return {k: torch.sigmoid(v) for k, v in self.sources.items()}
         return self.sources
+
+    def state_dict(self) -> dict[str, object]:
+        return {"sources": self.sources, "optimizer": self.optimizer.state_dict()}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        sources, optimizer_state = state["sources"], state["optimizer"]
+        assert isinstance(sources, dict) and isinstance(optimizer_state, dict)
+        _copy_sources_(self.sources, sources)
+        self.optimizer.load_state_dict(optimizer_state)
 
     def update_lr(self, step: int, total_steps: int) -> None:
         lr = get_scheduled_value(step, total_steps, self._lr_schedule)

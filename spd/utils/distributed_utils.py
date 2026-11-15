@@ -2,6 +2,8 @@
 
 import json
 import os
+import traceback
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
@@ -107,9 +109,19 @@ def with_distributed_cleanup[**P, T](fn: Callable[P, T]) -> Callable[P, T]:
     @wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
         try:
-            return fn(*args, **kwargs)
-        finally:
-            cleanup_distributed()
+            result = fn(*args, **kwargs)
+        except BaseException:
+            if not is_distributed():
+                raise
+            # destroy_process_group() can block forever after a failed collective, which keeps
+            # the GPUs allocated until the job's time limit. Exit hard so the launcher kills the
+            # remaining ranks.
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+        cleanup_distributed()
+        return result
 
     return wrapper
 

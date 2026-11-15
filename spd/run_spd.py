@@ -1,6 +1,7 @@
 """Run SPD on a model."""
 
 import gc
+import itertools
 import os
 from collections import defaultdict
 from collections.abc import Iterator
@@ -38,6 +39,17 @@ from spd.losses import compute_losses
 from spd.metrics import faithfulness_loss
 from spd.models.component_model import ComponentModel, OutputWithCache
 from spd.persistent_pgd import PersistentPGDState
+from spd.resume import (
+    install_stop_signal_handlers,
+    is_done,
+    latest_checkpoint,
+    load_checkpoint_files,
+    mark_done,
+    restore_data_positions,
+    restore_training_state,
+    save_checkpoint,
+    stop_requested_on_any_rank,
+)
 from spd.settings import SPD_OUT_DIR
 from spd.utils.component_utils import calc_ci_l_zero
 from spd.utils.distributed_utils import (
@@ -140,6 +152,18 @@ def optimize(
     if is_main_process():
         logger.info(f"Train+eval logs saved to directory: {out_dir}")
 
+    resume_dir = Path(config.resume_dir) if config.resume_dir is not None else None
+    ckpt = None
+    if resume_dir is not None:
+        assert config.resume_save_freq is not None, "resume_dir requires resume_save_freq"
+        assert not is_done(resume_dir), f"{resume_dir} is marked DONE; nothing to resume"
+        latest = latest_checkpoint(resume_dir) if resume_dir.exists() else None
+        if latest is not None:
+            logger.info(f"Resuming from {latest}")
+            ckpt = load_checkpoint_files(latest, config.batch_size)
+            restore_data_positions(ckpt, train_loader, eval_loader)
+        install_stop_signal_handlers()
+
     if config.identity_module_info is not None:
         insert_identity_operations_(
             target_model,
@@ -207,7 +231,7 @@ def optimize(
     optimized_params = component_params + ci_fn_params
     optimizer = optim.AdamW(optimized_params, lr=config.lr_schedule.start_val, weight_decay=0)
 
-    if config.faithfulness_warmup_steps > 0:
+    if config.faithfulness_warmup_steps > 0 and ckpt is None:
         run_faithfulness_warmup(component_model, component_params, config)
 
     persistent_pgd_configs: list[
@@ -230,7 +254,12 @@ def optimize(
         cfg for cfg in eval_metric_configs if cfg not in multibatch_pgd_eval_configs
     ]
 
-    sample_batch = extract_batch_data(next(train_iterator))
+    raw_sample_batch = next(train_iterator)
+    sample_batch = extract_batch_data(raw_sample_batch)
+    if ckpt is not None:
+        # On resume, train on this batch instead of discarding it so the data position matches
+        # the saved one.
+        train_iterator = itertools.chain([raw_sample_batch], train_iterator)
     batch_dims = (
         sample_batch.shape[:-1]
         if config.output_loss_type == "mse"  # if mse then input is a vector
@@ -251,7 +280,49 @@ def optimize(
         for ppgd_cfg in persistent_pgd_configs
     }
 
-    for step in tqdm(range(config.steps + 1), ncols=0, disable=not is_main_process()):
+    start_step = 0
+    resumed_at_step = ckpt.step if ckpt is not None else None
+    if ckpt is not None:
+        restore_training_state(
+            ckpt, component_model, optimizer, list(ppgd_states.values()), device
+        )
+        start_step = ckpt.step
+        del ckpt
+        gc.collect()
+        logger.info(f"Restored training state; continuing at step {start_step}")
+
+    for step in tqdm(
+        range(start_step, config.steps + 1),
+        initial=start_step,
+        total=config.steps + 1,
+        ncols=0,
+        disable=not is_main_process(),
+    ):
+        stop_after_this_step = step == config.stop_after_step
+        if resume_dir is None and stop_after_this_step:
+            logger.info(f"Reached stop_after_step={step}; stopping.")
+            return
+        if resume_dir is not None:
+            assert config.resume_save_freq is not None
+            stop = stop_requested_on_any_rank(device) or stop_after_this_step
+            periodic = step % config.resume_save_freq == 0 and step > start_step
+            # A stop right after resuming needs no save: that step's checkpoint already exists.
+            if periodic or (stop and step != resumed_at_step):
+                save_checkpoint(
+                    resume_dir=resume_dir,
+                    step=step,
+                    component_model=component_model,
+                    optimizer=optimizer,
+                    ppgd_states=list(ppgd_states.values()),
+                    train_loader=train_loader,
+                    eval_loader=eval_loader,
+                    batch_size=config.batch_size,
+                    device=device,
+                )
+            if stop:
+                logger.warning(f"Stopping at step {step} after checkpointing.")
+                return
+
         optimizer.zero_grad()
 
         step_lr = get_scheduled_value(
@@ -424,6 +495,10 @@ def optimize(
             if config.grad_clip_norm_ci_fns is not None:
                 clip_grad_norm_(ci_fn_params, config.grad_clip_norm_ci_fns)
             optimizer.step()
+
+    if resume_dir is not None:
+        sync_across_processes()
+        mark_done(resume_dir)
 
     if is_main_process():
         logger.info("Finished training loop.")
