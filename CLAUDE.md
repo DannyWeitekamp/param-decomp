@@ -39,6 +39,12 @@ The codebase supports three experimental domains: TMS (Toy Model of Superpositio
   - `gpt2` - Standard GPT-2
   - `ts` - TinyStories
 
+## VPD replication toolkit (`vpd/`)
+
+`vpd/` holds cluster-portable setup, configs, a Slurm launcher, and helpers for replicating the 4L Pile
+VPD run; see `vpd/README.md`. Resumable checkpoints live in `spd/resume.py` (config fields
+`resume_dir`, `resume_save_freq`, `stop_after_step`; all off by default).
+
 ## Research Papers
 
 This repository implements methods from two key research papers on parameter decomposition:
