@@ -2,10 +2,11 @@
 
 import json
 import os
-import traceback
 import sys
+import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import timedelta
 from functools import wraps
 from typing import Any, Literal
 
@@ -34,6 +35,10 @@ class DistributedState:
 _state: DistributedState | None = None
 
 _SHOULD_GET_INITIALIZED: bool = os.environ.get("WORLD_SIZE") is not None
+
+# Collective timeout. Resumable checkpoints are tens of GB written to shared storage while the other
+# ranks wait in a barrier; a slow filesystem can take well over NCCL's 10-minute default.
+PROCESS_GROUP_TIMEOUT = timedelta(minutes=60)
 
 
 def get_distributed_state() -> DistributedState | None:
@@ -83,6 +88,7 @@ def init_distributed() -> DistributedState | None:
         world_size=world_size,
         rank=rank,
         device_id=None if backend == "gloo" else device,
+        timeout=PROCESS_GROUP_TIMEOUT,
     )
 
     _state = DistributedState(
@@ -111,7 +117,9 @@ def with_distributed_cleanup[**P, T](fn: Callable[P, T]) -> Callable[P, T]:
         try:
             result = fn(*args, **kwargs)
         except BaseException:
-            if not is_distributed():
+            # Check _state directly: is_distributed() asserts it is set, which fails when
+            # init_distributed() itself raised (e.g. a bad GPU) and would hide the real error.
+            if _state is None:
                 raise
             # destroy_process_group() can block forever after a failed collective, which keeps
             # the GPUs allocated until the job's time limit. Exit hard so the launcher kills the

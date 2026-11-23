@@ -11,5 +11,10 @@ if (( SLURM_NTASKS > 1 )); then
   export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
 fi
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
+# NCCL flight recorder: on a collective timeout every rank dumps its recent collectives (with stack
+# traces) so we can see which rank stopped where. Dumps go to the shared logs dir, not node-local /tmp.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-20000}
+export TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=${TORCH_NCCL_DEBUG_INFO_TEMP_FILE:-$VPD_ROOT/logs/nccl_trace-${SLURM_JOB_ID:-local}-rank_}
 cd "$VPD_REPO"
 exec .venv/bin/python -u "$@"

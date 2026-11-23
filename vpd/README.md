@@ -31,18 +31,35 @@ vpd/slurm/submit.sh 1 $VPD_ROOT/configs/toy_resid_mlp1.yaml toy-resid
 vpd/slurm/submit.sh 8 $VPD_ROOT/configs/smoke_4L.yaml smoke-4L
 
 # 4. Resume A/B test (see below), then the full run:
-vpd/slurm/submit.sh --chain 8 $VPD_ROOT/configs/full_4L.yaml vpd-4L
+vpd/slurm/submit.sh --chain 20 8 $VPD_ROOT/configs/full_4L.yaml vpd-4L
 ```
 
-`submit.sh [--chain] <n_gpus> <config> <run_id> [extra sbatch args]` runs one node with one Slurm
-task per GPU. Outputs:
+`submit.sh [--chain K] <n_gpus> <config> <run_id> [extra sbatch args]` runs one node with one Slurm
+task per GPU. Extra sbatch args come last and override `VPD_SBATCH_ARGS`/`VPD_TIME`. Outputs:
 
 - logs: `$VPD_ROOT/logs/<run_id>-<jobid>.out`
 - metrics: `$SPD_OUT_DIR/spd/<run_id>/metrics.jsonl`
 - final model: `$SPD_OUT_DIR/spd/<run_id>/model_400000.pth`
 
-With `--chain`, a job that stops cleanly (time limit or preemption, after checkpointing) requeues
-itself until `resume_dir/DONE` exists. Cancel with `scancel`.
+With `--chain K`, K identical segments named `vpd-<run_id>` are submitted with
+`--dependency=singleton`: Slurm runs one at a time, and each resumes from `resume_dir`. A segment ends
+for any reason (time limit, preemption, node failure) and the next one starts, so this also works on
+clusters whose preemption CANCELs rather than requeues. Segments exit at once if `resume_dir/DONE`
+exists. Stop the chain with `scancel -n vpd-<run_id>`.
+
+Each segment runs a GPU preflight (context + matmul on every GPU) before starting the workers, and
+classifies how it ended:
+
+- `DONE`, a clean exit, or SIGTERM (time limit / preemption): normal end, the next segment resumes.
+- GPU error (preflight failure, "busy or unavailable", ECC, GPU lost): the node is appended to
+  `$VPD_ROOT/logs/bad_nodes.txt` and excluded from all pending and future segments, and a replacement
+  segment is submitted.
+- NCCL collective timeout or Slurm node failure: a replacement segment is submitted.
+- Anything else is treated as a code error and cancels the pending segments.
+
+Replacements are capped at `VPD_MAX_RETRIES` (default 5) per `submit.sh` call. `submit.sh` writes
+`$VPD_ROOT/logs/resubmit-<run_id>.sh`, which submits one more segment with the same arguments. On an
+NCCL timeout each rank dumps its flight-recorder trace to `$VPD_ROOT/logs/nccl_trace-<jobid>-rank_<r>`.
 
 ## Choosing GPU count
 
@@ -118,7 +135,7 @@ eval every 1000). Our runs log the same keys to `metrics.jsonl`.
 | `vpd/env.sh` | env vars for jobs: caches, `SPD_OUT_DIR`, uv, NCCL |
 | `vpd/setup.sh` | one-time install + downloads + configs |
 | `vpd/make_config.py`, `vpd/make_standard_configs.sh` | paper config + overrides into `$VPD_ROOT/configs` |
-| `vpd/slurm/submit.sh`, `train.sbatch`, `task.sh` | launcher (srun, one task per GPU, self-requeue) |
+| `vpd/slurm/submit.sh`, `train.sbatch`, `task.sh` | launcher (srun, one task per GPU, singleton-chained segments) |
 | `vpd/slurm/nccl_bench.sh` | all-reduce bandwidth check |
 | `vpd/tools/parse_log.py` | stdout log to `{step: metrics}` JSON |
 | `vpd/tools/compare_ab.py` | resume A/B comparison |
